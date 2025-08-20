@@ -21,7 +21,7 @@ DEFAULT_SETTINGS = {
     "extra_earnings": 0.0,          # running total added to current earnings (USD)
     # FX controls
     "use_live_fx": True,
-    "usd_mxn_rate": 18.00,          # last known USD->MXN (used & saved)
+    "usd_mxn_rate": 18.50,          # last known USD->MXN (used & saved)
     "usd_mxn_source": "manual",
     "usd_mxn_last_updated": "",     # ISO timestamp (UTC)
 }
