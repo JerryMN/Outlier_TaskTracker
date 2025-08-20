@@ -1,0 +1,19 @@
+{
+  "personal_target_hours": 36.0,
+  "tier_threshold_minutes": 5.0,
+  "bonus_milestones": [
+    {
+      "hours": 20.0,
+      "bonus": 43.5
+    },
+    {
+      "hours": 35.0,
+      "bonus": 101.5
+    }
+  ],
+  "extra_earnings": 43.6,
+  "use_live_fx": true,
+  "usd_mxn_rate": 18.7744,
+  "usd_mxn_source": "frankfurter",
+  "usd_mxn_last_updated": "2025-08-20T20:18:31.404083+00:00"
+}

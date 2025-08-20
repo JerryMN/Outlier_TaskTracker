@@ -1,0 +1,8 @@
+{
+  "antechamber_delivery": {
+    "hourly_rate": 17.4,
+    "discounted_rate": 5.22,
+    "pricing_mode": "tiered",
+    "tier_threshold_minutes": 180.0
+  }
+}
