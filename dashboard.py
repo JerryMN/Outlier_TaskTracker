@@ -5,6 +5,9 @@ from pathlib import Path
 from datetime import date, datetime, timezone
 import altair as alt
 import requests
+import gspread
+from gspread_dataframe import set_with_dataframe, get_as_dataframe
+from google.oauth2.service_account import Credentials
 
 DATA_DIR = Path("data")
 TASKS_CSV = DATA_DIR / "tasks.csv"
@@ -12,7 +15,7 @@ SETTINGS_JSON = DATA_DIR / "settings.json"
 TASK_RATES_JSON = DATA_DIR / "task_rates.json"
 
 DEFAULT_SETTINGS = {
-    "personal_target_hours": 36.0,
+    "personal_target_hours": 35.0,
     "tier_threshold_minutes": 5.0,  # fallback for tiered tasks if not set per task
     "bonus_milestones": [
         {"hours": 20.0, "bonus": 43.50},
@@ -26,65 +29,126 @@ DEFAULT_SETTINGS = {
     "usd_mxn_last_updated": "",     # ISO timestamp (UTC)
 }
 
-# ---------- Persistence Helpers ----------
-def ensure_data_dir():
-    DATA_DIR.mkdir(exist_ok=True)
+# ---------- Persistence: Google Sheets ----------
+# Requirements: pip install gspread gspread_dataframe google-auth
+GSHEETS_ID = st.secrets.get("GSHEETS_ID", "")
+GCP_SA = st.secrets.get("gcp_service_account", None)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+WS_TASKS = "tasks"
+WS_SETTINGS = "settings"
+WS_RATES = "task_rates"
+
+
+def _open_gsheet():
+    if not GCP_SA or not GSHEETS_ID:
+        raise RuntimeError("Missing GSHEETS_ID or gcp_service_account in st.secrets")
+    creds = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    return client.open_by_key(GSHEETS_ID)
+
+
+def _ensure_ws(sh, title, rows=1000, cols=26):
+    try:
+        return sh.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+
+
 
 
 def load_settings():
-    ensure_data_dir()
-    if SETTINGS_JSON.exists():
-        try:
-            s = json.loads(SETTINGS_JSON.read_text())
-            # merge defaults for any missing keys
-            for k, v in DEFAULT_SETTINGS.items():
-                s.setdefault(k, v)
-            return s
-        except Exception:
-            return DEFAULT_SETTINGS.copy()
-    return DEFAULT_SETTINGS.copy()
+    sh = _open_gsheet()
+    ws = _ensure_ws(sh, WS_SETTINGS, rows=10, cols=2)
+    raw = ws.acell("A1").value
+    if not raw:
+        ws.update("A1", json.dumps(DEFAULT_SETTINGS, indent=2))
+        return DEFAULT_SETTINGS.copy()
+    try:
+        s = json.loads(raw)
+    except Exception:
+        s = {}
+    for k, v in DEFAULT_SETTINGS.items():
+        s.setdefault(k, v)
+    return s
 
 
 def save_settings(settings: dict):
-    ensure_data_dir()
-    SETTINGS_JSON.write_text(json.dumps(settings, indent=2))
+    sh = _open_gsheet()
+    ws = _ensure_ws(sh, WS_SETTINGS, rows=10, cols=2)
+    ws.update("A1", json.dumps(settings, indent=2))
 
 
 def load_task_rates():
-    ensure_data_dir()
-    if TASK_RATES_JSON.exists():
-        try:
-            return json.loads(TASK_RATES_JSON.read_text())
-        except Exception:
-            return {}
-    return {}
-
+    sh = _open_gsheet()
+    ws = _ensure_ws(sh, WS_RATES)
+    df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+    if df is None or df.empty:
+        return {}
+    df = df.fillna("")
+    out = {}
+    for _, r in df.iterrows():
+        name = str(r.get("task", "")).strip()
+        if not name:
+            continue
+        out[name] = {
+            "hourly_rate": float(r.get("hourly_rate", 0) or 0),
+            "discounted_rate": float(r.get("discounted_rate", 0) or 0),
+            "pricing_mode": str(r.get("pricing_mode", "manual")).lower(),
+            "tier_threshold_minutes": float(r.get("tier_threshold_minutes", DEFAULT_SETTINGS["tier_threshold_minutes"]) or 0),
+        }
+    return out
 
 def save_task_rates(rates: dict):
-    ensure_data_dir()
-    TASK_RATES_JSON.write_text(json.dumps(rates, indent=2))
+    sh = _open_gsheet()
+    ws = _ensure_ws(sh, WS_RATES)
+    rows = []
+    for k, v in rates.items():
+        rows.append({
+            "task": k,
+            "hourly_rate": v.get("hourly_rate", 0.0),
+            "discounted_rate": v.get("discounted_rate", 0.0),
+            "pricing_mode": v.get("pricing_mode", "manual"),
+            "tier_threshold_minutes": v.get("tier_threshold_minutes", DEFAULT_SETTINGS["tier_threshold_minutes"]),
+        })
+    df = pd.DataFrame(rows, columns=["task","hourly_rate","discounted_rate","pricing_mode","tier_threshold_minutes"])
+    ws.clear()
+    if df.empty:
+        ws.update("A1:E1", [df.columns.tolist()])
+    else:
+        set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
 
 def load_tasks() -> pd.DataFrame:
-    ensure_data_dir()
-    if TASKS_CSV.exists():
-        df = pd.read_csv(TASKS_CSV)
-        expected_cols = ["date", "task", "minutes", "seconds", "rate_type"]
-        for c in expected_cols:
-            if c not in df.columns:
-                df[c] = pd.Series(dtype="object")
-        df = df[expected_cols]
-        df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
-        df["seconds"] = pd.to_numeric(df["seconds"], errors="coerce").fillna(0).astype(int)
-        df["rate_type"] = df["rate_type"].fillna("full")
-        return df.reset_index(drop=True)
-    else:
-        return pd.DataFrame(columns=["date", "task", "minutes", "seconds", "rate_type"])
+    sh = _open_gsheet()
+    ws = _ensure_ws(sh, WS_TASKS)
+    df = get_as_dataframe(ws, evaluate_formulas=True, header=0)
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=["date","task","minutes","seconds","rate_type"])
+        set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
+        return df
+    expected = ["date","task","minutes","seconds","rate_type"]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = pd.NA
+    df = df[expected]
+    df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
+    df["seconds"] = pd.to_numeric(df["seconds"], errors="coerce").fillna(0).astype(int)
+    df["rate_type"] = df["rate_type"].fillna("full")
+    try:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    except Exception:
+        df["date"] = df["date"].astype(str)
+    return df.reset_index(drop=True)
 
 
 def save_tasks(df: pd.DataFrame):
-    ensure_data_dir()
-    df.to_csv(TASKS_CSV, index=False)
+    sh = _open_gsheet()
+    ws = _ensure_ws(sh, WS_TASKS)
+    out = df.copy()
+    out = out[["date","task","minutes","seconds","rate_type"]]
+    set_with_dataframe(ws, out, include_index=False, include_column_header=True, resize=True)
 
 # ---------- FX (Live) ----------
 def fetch_usd_mxn_rate() -> tuple[float, str]:
