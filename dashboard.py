@@ -300,7 +300,7 @@ with st.sidebar:
     bm_df = pd.DataFrame(settings.get("bonus_milestones", []))
     if bm_df.empty:
         bm_df = pd.DataFrame([{"hours": 0.0, "bonus": 0.0}])
-    edited_bm = st.data_editor(bm_df, num_rows="dynamic", width=True, key="bm_editor")
+    edited_bm = st.data_editor(bm_df, num_rows="dynamic", width='stretch', key="bm_editor")
 
     st.subheader("🛠️ Task Rates")
     rates_df = pd.DataFrame([
@@ -308,7 +308,7 @@ with st.sidebar:
     ])
     if rates_df.empty:
         rates_df = pd.DataFrame([{ "task": "", "hourly_rate": 0.0, "discounted_rate": 0.0, "pricing_mode": "tiered", "tier_threshold_minutes": 30.0}])
-    edited_rates = st.data_editor(rates_df, num_rows="dynamic", width=True, key="rates_editor")
+    edited_rates = st.data_editor(rates_df, num_rows="dynamic", width='stretch', key="rates_editor")
 
     if st.button("💾 Save settings"):
         settings["bonus_milestones"] = [
@@ -386,7 +386,7 @@ try:
     else:
         chart = bg + fill
 
-    st.altair_chart(chart, width=True)
+    st.altair_chart(chart, width='stretch')
 except Exception:
     st.caption("Milestone markers unavailable.")
 
@@ -449,7 +449,7 @@ if "delete" not in tasks_display.columns:
 edited_display = st.data_editor(
     tasks_display,
     num_rows="fixed",
-    width=True,
+    width='stretch',
     key="tasks_editor",
     column_config={
         "minutes": st.column_config.NumberColumn("minutes", step=1),
