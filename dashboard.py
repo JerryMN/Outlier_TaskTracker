@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import json
-from pathlib import Path
 from datetime import date, datetime, timezone
 import altair as alt
 import requests
@@ -9,14 +8,9 @@ import gspread
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
 from google.oauth2.service_account import Credentials
 
-DATA_DIR = Path("data")
-TASKS_CSV = DATA_DIR / "tasks.csv"
-SETTINGS_JSON = DATA_DIR / "settings.json"
-TASK_RATES_JSON = DATA_DIR / "task_rates.json"
-
 DEFAULT_SETTINGS = {
     "personal_target_hours": 35.0,
-    "tier_threshold_minutes": 5.0,  # fallback for tiered tasks if not set per task
+    "tier_threshold_minutes": 30.0,  # fallback for tiered tasks if not set per task
     "bonus_milestones": [
         {"hours": 20.0, "bonus": 43.50},
         {"hours": 35.0, "bonus": 101.50}
@@ -29,25 +23,28 @@ DEFAULT_SETTINGS = {
     "usd_mxn_last_updated": "",     # ISO timestamp (UTC)
 }
 
-# ---------- Persistence: Google Sheets ----------
-# Requirements: pip install gspread gspread_dataframe google-auth
+# ---------- Use Google Sheets for saving data ----------
 GSHEETS_ID = st.secrets.get("GSHEETS_ID", "")
 GCP_SA = st.secrets.get("gcp_service_account", None)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-
 WS_TASKS = "tasks"
 WS_SETTINGS = "settings"
 WS_RATES = "task_rates"
 
-
+# ---------- Google Sheets Functions ----------
 def _open_gsheet():
     if not GCP_SA or not GSHEETS_ID:
-        raise RuntimeError("Missing GSHEETS_ID or gcp_service_account in st.secrets")
+        raise RuntimeError("Streamlit Secrets not properly configured.")
     creds = Credentials.from_service_account_info(GCP_SA, scopes=SCOPES)
     client = gspread.authorize(creds)
-    return client.open_by_key(GSHEETS_ID)
-
+    try:
+        return client.open_by_key(GSHEETS_ID)
+    except gspread.SpreadsheetNotFound:
+        st.error("Spreadsheet not found. Double-check GSHEETS_ID (the string between /d/ and /edit in the URL).")
+        st.stop()
+    except Exception as e:
+        st.error(f"Google Sheets error: {e}")
+        st.stop()
 
 def _ensure_ws(sh, title, rows=1000, cols=26):
     try:
@@ -55,15 +52,13 @@ def _ensure_ws(sh, title, rows=1000, cols=26):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
-
-
-
+# ---------- Data Functions ----------
 def load_settings():
     sh = _open_gsheet()
     ws = _ensure_ws(sh, WS_SETTINGS, rows=10, cols=2)
     raw = ws.acell("A1").value
     if not raw:
-        ws.update("A1", json.dumps(DEFAULT_SETTINGS, indent=2))
+        ws.update("A1", [[json.dumps(DEFAULT_SETTINGS, indent=2)]], value_input_option="RAW")
         return DEFAULT_SETTINGS.copy()
     try:
         s = json.loads(raw)
@@ -73,12 +68,10 @@ def load_settings():
         s.setdefault(k, v)
     return s
 
-
 def save_settings(settings: dict):
     sh = _open_gsheet()
     ws = _ensure_ws(sh, WS_SETTINGS, rows=10, cols=2)
-    ws.update("A1", json.dumps(settings, indent=2))
-
+    ws.update("A1", [[json.dumps(settings, indent=2)]], value_input_option="RAW")
 
 def load_task_rates():
     sh = _open_gsheet()
@@ -119,7 +112,6 @@ def save_task_rates(rates: dict):
     else:
         set_with_dataframe(ws, df, include_index=False, include_column_header=True, resize=True)
 
-
 def load_tasks() -> pd.DataFrame:
     sh = _open_gsheet()
     ws = _ensure_ws(sh, WS_TASKS)
@@ -142,7 +134,6 @@ def load_tasks() -> pd.DataFrame:
         df["date"] = df["date"].astype(str)
     return df.reset_index(drop=True)
 
-
 def save_tasks(df: pd.DataFrame):
     sh = _open_gsheet()
     ws = _ensure_ws(sh, WS_TASKS)
@@ -150,7 +141,7 @@ def save_tasks(df: pd.DataFrame):
     out = out[["date","task","minutes","seconds","rate_type"]]
     set_with_dataframe(ws, out, include_index=False, include_column_header=True, resize=True)
 
-# ---------- FX (Live) ----------
+# ---------- Live FX Functions ----------
 def fetch_usd_mxn_rate() -> tuple[float, str]:
     """Try multiple public sources for USD->MXN. Returns (rate, source_name)."""
     sources = [
@@ -175,7 +166,7 @@ def fetch_usd_mxn_rate() -> tuple[float, str]:
             continue
     raise RuntimeError("No FX source reachable")
 
-# ---------- Earnings Logic ----------
+# ---------- Compute Functions ----------
 def compute_task_earning(minutes: int, seconds: int, rate_type: str, task_rates: dict, task_name: str) -> float:
     m = int(minutes)
     s = int(seconds)
@@ -196,7 +187,6 @@ def compute_task_earning(minutes: int, seconds: int, rate_type: str, task_rates:
         rate = hr if str(rate_type).lower() == "full" else dr
         return (total_minutes / 60.0) * rate
 
-
 def compute_metrics(tasks_df: pd.DataFrame, settings: dict, task_rates: dict) -> dict:
     df = tasks_df.copy()
     if df.empty:
@@ -208,7 +198,8 @@ def compute_metrics(tasks_df: pd.DataFrame, settings: dict, task_rates: dict) ->
             "bonuses_earned": 0.0,
             "bonuses_unlocked": [],
             "remaining_hours_to_target": settings["personal_target_hours"],
-            "tasks_needed": None
+            "tasks_needed": None,
+            "task_count": 0,
         }
 
     df["earning"] = df.apply(
@@ -245,10 +236,11 @@ def compute_metrics(tasks_df: pd.DataFrame, settings: dict, task_rates: dict) ->
         "bonuses_unlocked": bonuses_unlocked,
         "remaining_hours_to_target": remaining_hours,
         "tasks_needed": tasks_needed,
+        "task_count": int(len(df)),
         "per_task": df,
     }
 
-# ---------- UI ----------
+# --------------------- UI -------------------
 st.set_page_config(page_title="Outlier Earnings Dashboard", page_icon="📈", layout="wide", initial_sidebar_state="collapsed")
 st.title("📈 Outlier Earnings Dashboard")
 
@@ -266,6 +258,7 @@ if settings.get("use_live_fx", True) and not settings.get("usd_mxn_last_updated"
     except Exception:
         pass
 
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("⚙️ Settings")
     settings["personal_target_hours"] = st.number_input("Personal target (hrs)", min_value=0.0, value=float(settings["personal_target_hours"]))
@@ -307,15 +300,15 @@ with st.sidebar:
     bm_df = pd.DataFrame(settings.get("bonus_milestones", []))
     if bm_df.empty:
         bm_df = pd.DataFrame([{"hours": 0.0, "bonus": 0.0}])
-    edited_bm = st.data_editor(bm_df, num_rows="dynamic", use_container_width=True, key="bm_editor")
+    edited_bm = st.data_editor(bm_df, num_rows="dynamic", width=True, key="bm_editor")
 
     st.subheader("🛠️ Task Rates")
     rates_df = pd.DataFrame([
         {"task": k, **v} for k, v in task_rates.items()
     ])
     if rates_df.empty:
-        rates_df = pd.DataFrame([{ "task": "", "hourly_rate": 0.0, "discounted_rate": 0.0, "pricing_mode": "manual", "tier_threshold_minutes": 5.0}])
-    edited_rates = st.data_editor(rates_df, num_rows="dynamic", use_container_width=True, key="rates_editor")
+        rates_df = pd.DataFrame([{ "task": "", "hourly_rate": 0.0, "discounted_rate": 0.0, "pricing_mode": "tiered", "tier_threshold_minutes": 30.0}])
+    edited_rates = st.data_editor(rates_df, num_rows="dynamic", width=True, key="rates_editor")
 
     if st.button("💾 Save settings"):
         settings["bonus_milestones"] = [
@@ -338,7 +331,7 @@ with st.sidebar:
 
 st.divider()
 
-# --------------------- Metrics & Progress (Top) -------------------
+# ---------- KPIs ----------
 metrics = compute_metrics(load_tasks(), settings, task_rates)
 
 # Compute MXN conversion for current earnings. Remove 4.5%  from Paypal commission.
@@ -351,13 +344,13 @@ with m1:
 with m2:
     st.metric("Bonuses earned", f"${metrics['bonuses_earned']:.2f}")
 with m3:
-    st.metric("Avg task time", f"{metrics['avg_task_minutes']:.2f} min")
+    st.metric("Number of tasks", f"{int(metrics.get('task_count', 0))}")
 with m4:
-    st.metric("Current earnings (USD)", f"${earnings_usd:.2f}")
+    st.metric("Earnings (USD)", f"${earnings_usd:.2f}")
 with m5:
     st.metric("Earnings (MXN)", f"${earnings_mxn:,.2f}")
 
-# Charts
+# ---------- Chart ----------
 st.subheader("🏁 Progress to personal target")
 target_hours = float(settings.get("personal_target_hours", 0.0))
 current_hours = float(metrics["total_hours"]) if metrics else 0.0
@@ -393,13 +386,13 @@ try:
     else:
         chart = bg + fill
 
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width=True)
 except Exception:
     st.caption("Milestone markers unavailable.")
 
 st.divider()
 
-# --------------------- Task Logger --------------------------
+# ---------- Task Logger ----------
 st.subheader("📝 Log a task")
 with st.form("task_form", clear_on_submit=True):
     c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1])
@@ -438,7 +431,7 @@ with st.form("task_form", clear_on_submit=True):
             st.success("Task added.")
             st.rerun()
 
-# --------------------- Task log (read-only + delete) --------
+# ---------- Task Table ----------
 st.subheader("📚 Task log")
 _tasks_raw = load_tasks()
 if not _tasks_raw.empty:
@@ -456,7 +449,7 @@ if "delete" not in tasks_display.columns:
 edited_display = st.data_editor(
     tasks_display,
     num_rows="fixed",
-    use_container_width=True,
+    width=True,
     key="tasks_editor",
     column_config={
         "minutes": st.column_config.NumberColumn("minutes", step=1),
@@ -492,7 +485,7 @@ with col_tc:
         st.warning("All tasks cleared.")
         st.rerun()
 
-# --------------------- Mode Explanation --------------------
+# ---------- Manual vs Tiered ----------
 with st.expander("What do Manual vs Tiered pricing mean?"):
     st.markdown(
         """
