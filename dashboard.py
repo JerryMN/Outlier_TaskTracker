@@ -386,7 +386,7 @@ try:
     else:
         chart = bg + fill
 
-    st.altair_chart(chart, width='stretch')
+    st.altair_chart(chart, use_container_width=True)
 except Exception:
     st.caption("Milestone markers unavailable.")
 
